@@ -14,10 +14,12 @@ import com.example.demo.repository.TimeFrameRepository;
 import com.example.demo.repository.UserRepository;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.transaction.Transactional;
 import lombok.AccessLevel;
 import lombok.RequiredArgsConstructor;
 import lombok.experimental.FieldDefaults;
 import lombok.extern.slf4j.Slf4j;
+import org.redisson.api.RLock;
 import org.redisson.api.RMapCache;
 import org.redisson.api.RedissonClient;
 import org.springframework.security.core.context.SecurityContextHolder;
@@ -27,7 +29,6 @@ import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.temporal.ChronoUnit;
-import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
@@ -50,37 +51,82 @@ public class AttendanceRecordsService {
     static String CACHE_PREFIX = "attendance:";
     static long CACHE_TTL = 1;
 
+    @Transactional
     public AttendanceRecords markAttendance() {
         var context = SecurityContextHolder.getContext();
         String name = context.getAuthentication().getName();
-        User user = userRepository.findByUsername(name).orElseThrow(() -> new AppException(ErrorCode.USER_NOT_EXISTED));
+        User user = userRepository.findByUsername(name)
+                .orElseThrow(() -> new AppException(ErrorCode.USER_NOT_EXISTED));
+
         LocalDate today = LocalDate.now();
-        boolean alreadyChecked = attendanceRecordsRepository.existsAttendanceRecordsByUserAndAndAttendanceDate(user, today);
-        if (alreadyChecked) {
+        String cacheKey = "attendance:checked:" + user.getId() + ":" + today;
+        RMapCache<String, String> mapCache = redissonClient.getMapCache("attendanceCache");
+
+        if (Boolean.TRUE.toString().equals(mapCache.get(cacheKey))) {
             throw new AppException(ErrorCode.ALREADY_CHECKED);
         }
-        List<TimeFrame> timeFrames = timeFrameRepository.findAll();
-        LocalTime now = LocalTime.now();
-        boolean isOnTime = timeFrames.stream()
-                .anyMatch(timeFrame -> !now.isBefore(timeFrame.getStart()) && now.isAfter(timeFrame.getEnd()));
-        if (!isOnTime) throw new AppException(ErrorCode.NOT_ON_TIME);
-        AttendanceReward attendanceReward = attendanceRewardRepository.findAttendanceRewardsByRewardDate(today)
-                .orElseThrow(() -> new AppException(ErrorCode.REWARD_NOT_FOUND));
-        AttendanceRecords record = AttendanceRecords.builder()
-                .user(user)
-                .attendanceDate(today)
-                .rewardAmount(attendanceReward.getRewardAmount())
-                .checkedInAt(LocalDateTime.now())
-                .build();
 
-        RMapCache<String, String> mapCache = redissonClient.getMapCache("attendanceCache");
-        mapCache.keySet().stream()
-                .filter(key -> key.contains(user.getId()) && key.contains("attendance"))
-                .forEach(mapCache::remove);
-        mapCache.remove("rewardHistory:" + user.getId());
-        log.info("Invalidated cache for user {} on date {}", user.getId(), today);
-        return attendanceRecordsRepository.save(record);
+        String lockKey = "lock:attendance:" + user.getId() + ":" + today;
+        RLock lock = redissonClient.getLock(lockKey);
+        boolean locked = false;
+
+        try {
+            locked = lock.tryLock(5, 10, TimeUnit.SECONDS);
+            if (!locked) {
+                throw new AppException(ErrorCode.UNCATEGORIZED_EXCEPTION);
+            }
+
+            if (attendanceRecordsRepository.existsAttendanceRecordsByUserAndAndAttendanceDate(user, today)) {
+                mapCache.put(cacheKey, Boolean.TRUE.toString(), 1, TimeUnit.DAYS);
+                throw new AppException(ErrorCode.ALREADY_CHECKED);
+            }
+
+            List<TimeFrame> timeFrames = timeFrameRepository.findAll();
+            LocalTime now = LocalTime.now();
+            boolean isOnTime = timeFrames.stream()
+                    .anyMatch(timeFrame -> !now.isBefore(timeFrame.getStart()) && now.isAfter(timeFrame.getEnd()));
+
+            if (!isOnTime) {
+                throw new AppException(ErrorCode.NOT_ON_TIME);
+            }
+
+            AttendanceReward attendanceReward = attendanceRewardRepository.findAttendanceRewardsByRewardDate(today)
+                    .orElseThrow(() -> new AppException(ErrorCode.REWARD_NOT_FOUND));
+
+            AttendanceRecords record = AttendanceRecords.builder()
+                    .user(user)
+                    .attendanceDate(today)
+                    .rewardAmount(attendanceReward.getRewardAmount())
+                    .checkedInAt(LocalDateTime.now())
+                    .build();
+            user.setLotus(user.getLotus() + attendanceReward.getRewardAmount());
+            userRepository.save(user);
+
+            mapCache.put(cacheKey, Boolean.TRUE.toString(), 1, TimeUnit.DAYS);
+            mapCache.put("reward:" + user.getId() + ":" + today, Integer.toString(attendanceReward.getRewardAmount()), 1, TimeUnit.DAYS);
+
+            mapCache.keySet().stream()
+                    .filter(key -> key.contains(user.getId()) && key.contains("attendance"))
+                    .forEach(mapCache::remove);
+            mapCache.remove("rewardHistory:" + user.getId());
+
+            log.info("Invalidated cache for user {} on date {}", user.getId(), today);
+
+            return attendanceRecordsRepository.save(record);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("Thread was interrupted", e);
+            throw new AppException(ErrorCode.UNCATEGORIZED_EXCEPTION);
+        } catch (Exception e) {
+            log.error("Error processing attendance", e);
+            throw new AppException(ErrorCode.UNCATEGORIZED_EXCEPTION);
+        } finally {
+            if (locked) {
+                lock.unlock();
+            }
+        }
     }
+
 
     public List<AttendanceRecordResponse> getListChecking(LocalDate startDate, LocalDate endDate) {
         var context = SecurityContextHolder.getContext();
@@ -97,37 +143,62 @@ public class AttendanceRecordsService {
                 return objectMapper.readValue(jsonData, new TypeReference<List<AttendanceRecordResponse>>() {});
             }
 
-            log.info("Fetching from DB and caching: {}", cacheKey);
-            Map<LocalDate, AttendanceRecords> attendanceRecords =
-                    attendanceRecordsRepository.findByUserIdAndAttendanceDateBetween(user.getId(), startDate.toString(), endDate.toString())
-                            .stream()
-                            .collect(Collectors.toMap(
-                                    AttendanceRecords::getAttendanceDate,
-                                    record -> record,
-                                    (existing, replacement) -> existing
-                            ));
+            String lockKey = "lock:" + cacheKey;
+            RLock lock = redissonClient.getLock(lockKey);
+            boolean locked = false;
 
-            List<AttendanceRecordResponse> response = Stream.iterate(startDate, date -> date.plusDays(1))
-                    .limit(ChronoUnit.DAYS.between(startDate, endDate) + 1)
-                    .map(date -> {
-                        AttendanceRecords attendanceRecord = attendanceRecords.get(date);
-                        return AttendanceRecordResponse.builder()
-                                .isChecked(attendanceRecord != null)
-                                .attendanceDate(date)
-                                .rewardAmount(attendanceRecord != null ? attendanceRecord.getRewardAmount() : 0)
-                                .build();
-                    })
-                    .toList();
+            try {
+                locked = lock.tryLock(5, 10, TimeUnit.SECONDS);
+                if (!locked) {
+                    log.info("Waiting for cache to be updated...");
+                    Thread.sleep(500);
+                    if (mapCache.containsKey(cacheKey)) {
+                        return objectMapper.readValue(mapCache.get(cacheKey), new TypeReference<List<AttendanceRecordResponse>>() {});
+                    } else {
+                        throw new AppException(ErrorCode.UNCATEGORIZED_EXCEPTION);
+                    }
+                }
 
-            String jsonData = objectMapper.writeValueAsString(response);
-            mapCache.put(cacheKey, jsonData, CACHE_TTL, TimeUnit.DAYS);
+                log.info("Fetching from DB and caching: {}", cacheKey);
+                Map<LocalDate, AttendanceRecords> attendanceRecords = attendanceRecordsRepository
+                        .findByUserIdAndAttendanceDateBetween(user.getId(), startDate.toString(), endDate.toString())
+                        .stream()
+                        .collect(Collectors.toMap(AttendanceRecords::getAttendanceDate, record -> record));
 
-            return response;
+                List<AttendanceRecordResponse> response = Stream.iterate(startDate, date -> date.plusDays(1))
+                        .limit(ChronoUnit.DAYS.between(startDate, endDate) + 1)
+                        .map(date -> {
+                            AttendanceRecords attendanceRecord = attendanceRecords.get(date);
+                            return AttendanceRecordResponse.builder()
+                                    .isChecked(attendanceRecord != null)
+                                    .attendanceDate(date)
+                                    .rewardAmount(attendanceRecord != null ? attendanceRecord.getRewardAmount() : 0)
+                                    .build();
+                        })
+                        .toList();
+
+                String jsonData = objectMapper.writeValueAsString(response);
+                mapCache.put(cacheKey, jsonData, CACHE_TTL, TimeUnit.DAYS);
+
+                return response;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                log.error("Thread was interrupted", e);
+                throw new AppException(ErrorCode.UNCATEGORIZED_EXCEPTION);
+            } catch (Exception e) {
+                log.error("Error processing attendance history", e);
+                throw new AppException(ErrorCode.UNCATEGORIZED_EXCEPTION);
+            } finally {
+                if (locked) {
+                    lock.unlock();
+                }
+            }
         } catch (Exception e) {
             log.error("Error processing attendance history", e);
             throw new AppException(ErrorCode.UNCATEGORIZED_EXCEPTION);
         }
     }
+
 
     public List<RewardHistoryResponse> getAllRewardHistory() {
         var context = SecurityContextHolder.getContext();
@@ -146,18 +217,39 @@ public class AttendanceRecordsService {
                 return objectMapper.readValue(jsonData, new TypeReference<List<RewardHistoryResponse>>() {});
             }
 
-            log.info("Fetching from DB and caching: {}", cacheKey);
-            List<AttendanceRecords> records = attendanceRecordsRepository.findByUserId(user.getId());
+            String lockKey = "lock:rewardHistory:" + user.getId();
+            RLock lock = redissonClient.getLock(lockKey);
+            boolean locked = false;
 
-            List<RewardHistoryResponse> response = records.stream()
-                    .map(record -> new RewardHistoryResponse(record.getAttendanceDate(), record.getRewardAmount()))
-                    .sorted(Comparator.comparing(RewardHistoryResponse::getDate).reversed())
-                    .toList();
+            try {
+                locked = lock.tryLock(5, 10, TimeUnit.SECONDS);
+                if (!locked) {
+                    throw new AppException(ErrorCode.UNCATEGORIZED_EXCEPTION);
+                }
 
-            String jsonData = objectMapper.writeValueAsString(response);
-            mapCache.put(cacheKey, jsonData, CACHE_TTL, TimeUnit.DAYS);
+                if (mapCache.containsKey(cacheKey)) {
+                    log.info("Fetching from Redis after acquiring lock: {}", cacheKey);
+                    String jsonData = mapCache.get(cacheKey);
+                    return objectMapper.readValue(jsonData, new TypeReference<List<RewardHistoryResponse>>() {});
+                }
 
-            return response;
+                log.info("Fetching from DB and caching: {}", cacheKey);
+                List<AttendanceRecords> records = attendanceRecordsRepository.findByUserId(user.getId());
+
+                List<RewardHistoryResponse> response = records.stream()
+                        .map(record -> new RewardHistoryResponse(record.getAttendanceDate(), record.getRewardAmount()))
+                        .sorted(Comparator.comparing(RewardHistoryResponse::getDate).reversed())
+                        .toList();
+
+                String jsonData = objectMapper.writeValueAsString(response);
+                mapCache.put(cacheKey, jsonData, CACHE_TTL, TimeUnit.DAYS);
+
+                return response;
+            } finally {
+                if (locked) {
+                    lock.unlock();
+                }
+            }
         } catch (Exception e) {
             log.error("Error processing reward history", e);
             throw new AppException(ErrorCode.UNCATEGORIZED_EXCEPTION);
