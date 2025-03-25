@@ -47,6 +47,7 @@ public class AttendanceRecordsService {
     AttendanceRewardRepository attendanceRewardRepository;
     RedissonClient redissonClient;
     ObjectMapper objectMapper;
+    CacheService cacheService;
 
     static String CACHE_PREFIX = "attendance:";
     static long CACHE_TTL = 1;
@@ -55,8 +56,7 @@ public class AttendanceRecordsService {
     public AttendanceRecords markAttendance() {
         var context = SecurityContextHolder.getContext();
         String name = context.getAuthentication().getName();
-        User user = userRepository.findByUsername(name)
-                .orElseThrow(() -> new AppException(ErrorCode.USER_NOT_EXISTED));
+        User user = cacheService.getUserFromCache(name);
 
         LocalDate today = LocalDate.now();
         String cacheKey = "attendance:checked:" + user.getId() + ":" + today;
@@ -81,7 +81,7 @@ public class AttendanceRecordsService {
                 throw new AppException(ErrorCode.ALREADY_CHECKED);
             }
 
-            List<TimeFrame> timeFrames = timeFrameRepository.findAll();
+            List<TimeFrame> timeFrames = cacheService.getTimeFramesFromCache();
             LocalTime now = LocalTime.now();
             boolean isOnTime = timeFrames.stream()
                     .anyMatch(timeFrame -> !now.isBefore(timeFrame.getStart()) && now.isAfter(timeFrame.getEnd()));
@@ -90,8 +90,7 @@ public class AttendanceRecordsService {
                 throw new AppException(ErrorCode.NOT_ON_TIME);
             }
 
-            AttendanceReward attendanceReward = attendanceRewardRepository.findAttendanceRewardsByRewardDate(today)
-                    .orElseThrow(() -> new AppException(ErrorCode.REWARD_NOT_FOUND));
+            AttendanceReward attendanceReward = cacheService.getAttendanceRewardFromCache(today);
 
             AttendanceRecords record = AttendanceRecords.builder()
                     .user(user)
@@ -101,7 +100,8 @@ public class AttendanceRecordsService {
                     .build();
             user.setLotus(user.getLotus() + attendanceReward.getRewardAmount());
             userRepository.save(user);
-
+            String jsonData = objectMapper.writeValueAsString(user);
+            mapCache.put("user:" + name,jsonData , 1, TimeUnit.DAYS);
             mapCache.put(cacheKey, Boolean.TRUE.toString(), 1, TimeUnit.DAYS);
             mapCache.put("reward:" + user.getId() + ":" + today, Integer.toString(attendanceReward.getRewardAmount()), 1, TimeUnit.DAYS);
 
@@ -132,7 +132,7 @@ public class AttendanceRecordsService {
         var context = SecurityContextHolder.getContext();
         String name = context.getAuthentication().getName();
 
-        User user = userRepository.findByUsername(name).orElseThrow(() -> new AppException(ErrorCode.USER_NOT_EXISTED));
+        User user = cacheService.getUserFromCache(name);
         String cacheKey = CACHE_PREFIX + user.getId() + ":" + startDate + ":" + endDate;
         RMapCache<String, String> mapCache = redissonClient.getMapCache("attendanceCache");
 
@@ -204,9 +204,7 @@ public class AttendanceRecordsService {
         var context = SecurityContextHolder.getContext();
         String name = context.getAuthentication().getName();
 
-        User user = userRepository.findByUsername(name)
-                .orElseThrow(() -> new AppException(ErrorCode.USER_NOT_EXISTED));
-
+        User user = cacheService.getUserFromCache(name);
         String cacheKey = "rewardHistory:" + user.getId();
         RMapCache<String, String> mapCache = redissonClient.getMapCache("rewardCache");
 
